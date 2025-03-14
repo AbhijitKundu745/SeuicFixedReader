@@ -44,7 +44,7 @@ open class UHFActivity() : AppCompatActivity() {
     var statenvtick = 0L
     private var startSearching = true
     private val lastTagPostTime = HashMap<String, Long>() // Stores last posted timestamp for each tag
-    private val postInterval = 500 // Interval in milliseconds
+    private val postInterval = 100 // Interval in milliseconds
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         initData();

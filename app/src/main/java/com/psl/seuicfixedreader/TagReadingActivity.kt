@@ -2,13 +2,16 @@ package com.psl.seuicfixedreader
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Message
 import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
 import androidx.databinding.DataBindingUtil
+import androidx.lifecycle.MutableLiveData
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.gson.Gson
 import com.google.gson.JsonArray
@@ -18,7 +21,6 @@ import com.psl.seuicfixedreader.APIHelpers.APIService
 import com.psl.seuicfixedreader.APIHelpers.AuthRequest
 import com.psl.seuicfixedreader.APIHelpers.dataModels
 import com.psl.seuicfixedreader.MQTT.MQTTConnection
-import com.psl.seuicfixedreader.MQTT.MQTTPub
 import com.psl.seuicfixedreader.MQTT.MqttConnectionCallBack
 import com.psl.seuicfixedreader.MQTT.MqttPublisher
 import com.psl.seuicfixedreader.MQTT.MqttResponseCallback
@@ -30,9 +32,12 @@ import com.psl.seuicfixedreader.helper.ConnectionManager
 import com.psl.seuicfixedreader.helper.SharedPreferencesUtils
 import com.seuic.uhfandroid.ext.totalCounts
 import com.seuic.uhfandroid.util.ByteUtil
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Runnable
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Call
@@ -43,8 +48,12 @@ import retrofit2.converter.gson.GsonConverterFactory
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.util.Stack
+import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.Executors
+import java.util.concurrent.locks.ReentrantLock
 
-class TagReadingActivity : UHFActivity() {
+class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
     private val context: Context = this
     lateinit var binding: ActivityTagReadingBinding
     private lateinit var sharedPreferencesUtils : SharedPreferencesUtils
@@ -57,15 +66,26 @@ class TagReadingActivity : UHFActivity() {
     private lateinit var cd : ConnectionManager
     private var authResData: dataModels.AuthRes? = null
     private val tagDetails: MutableList<TagBean> = mutableListOf()
-    private lateinit var mqttPub: MqttPublisher
+    private var mqttPub: MqttPublisher = MqttPublisher()
     private lateinit var dataPostingHandler: Handler
     private lateinit var dataPostingRunnable: Runnable
+    private lateinit var dataPushingHandler: Handler
+    private lateinit var dataPushingRunnable: Runnable
     private var mqttConnection: MQTTConnection = MQTTConnection()
+    // Thread-safe Deque (Stack) for LIFO behavior
+    private val messageStack: ConcurrentLinkedDeque<Pair<String, String>> = ConcurrentLinkedDeque()
+    // Single-threaded executor ensures only one message is processed at a time
+    private val executor = Executors.newSingleThreadExecutor()
+    private val MAX_STACK_SIZE = 150 // Adjust based on your needs
+    private val ADJUST_STACK_SIZE = (MAX_STACK_SIZE * 0.3).toInt() // Adjust based on your needs
+    private val tagListLiveData = MutableLiveData<MutableList<TagBean>>(mutableListOf())
+    private val lock = ReentrantLock() // Lock for exclusive access
     @SuppressLint("HardwareIds", "SetTextI18n")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = DataBindingUtil.setContentView(this, R.layout.activity_tag_reading)
-        cd = ConnectionManager.getInstance(application)
+        cd = ConnectionManager(this, this)
+        cd.registerNetworkCallback()
         sharedPreferencesUtils = SharedPreferencesUtils(context)
         deviceId = Settings.Secure.getString(this.contentResolver, Settings.Secure.ANDROID_ID)
         deviceId = deviceId.uppercase()
@@ -76,10 +96,20 @@ class TagReadingActivity : UHFActivity() {
         adapter = TagInfoAdapter(R.layout.layout_tag)
         adapter.notifyDataSetChanged()
 
-        tagData.observe(this) {bean ->
-            bean?.let { setListData(bean) }
+         if(cd.isConnectedToWiFi()){
+                if(binding.showURL.text.isNotEmpty()){
+                    sharedPreferencesUtils.getDeviceID()?.let { getAuthorizeData(it) }
+                }
         }
 
+        tagData.observe(this) {bean ->
+            bean?.let {
+                setListData(it)
+            }
+        }
+
+        startDataPushingHandler()
+        startDataPostingHandler()
         binding.btnStart.setOnClickListener{
             tagData.postValue(null)
             adapter.notifyDataSetChanged()
@@ -106,23 +136,14 @@ class TagReadingActivity : UHFActivity() {
             connectedAntennas.observe(this) { antennaArray ->
                 Log.e("HereAnts", antennaArray.contentToString())
                 updateCheckboxes(antennaArray)
-                if(authResData?.Topic?.isNotEmpty() == true){
-                    val configTopic = authResData!!.Topic.filter { it.Title == "ReaderConfig" }
-                    if(configTopic.isNotEmpty()){
-                        for (topic in configTopic) {
-                            val topicName = topic.TopicName+sharedPreferencesUtils.getDeviceID()
+                if(mqttConnection.isConnected()) {
+                        val topicName = getTopicName("DataConfig")
+                        if (topicName.isNotEmpty()) {
                             sendConfigData(topicName)
                         }
-                    }
-                }
-                else{
-                    Toast.makeText(context, "No Topic to send", Toast.LENGTH_SHORT).show()
                 }
             }
         }
-
-        startdataPostingHandler()
-
 
         binding.URLButton.setOnClickListener{
             if (binding.URL.text.isNotEmpty()) {
@@ -136,15 +157,6 @@ class TagReadingActivity : UHFActivity() {
         }
         binding.showURL.text = sharedPreferencesUtils.getURL().toString()
 
-        cd.observe(this) { isConnected ->
-            if(isConnected){
-                if(binding.showURL.text.isNotEmpty()){
-                    sharedPreferencesUtils.getDeviceID()?.let { getAuthorizeData(it) }
-                    mqttConnect()
-                }
-            }
-        }
-
     }
     private fun startAntennaHandler() {
         antennaCheckHandler = Handler(Looper.getMainLooper())
@@ -154,58 +166,74 @@ class TagReadingActivity : UHFActivity() {
                 antennaCheckHandler.postDelayed(this, 10000)
             }
         }
-        antennaCheckHandler.postDelayed(antennaCheckRunnable, 0)
+        antennaCheckHandler.postDelayed(antennaCheckRunnable, 10000)
     }
-    private fun startdataPostingHandler() {
+    private fun startDataPushingHandler() {
+        dataPushingHandler = Handler(Looper.getMainLooper())
+        dataPushingRunnable = object : Runnable {
+            override fun run() {
+                if(tagDetails.isNotEmpty()){
+                    pushToQueue(tagDetails)
+                }
+                dataPushingHandler.postDelayed(this, 500)
+            }
+
+        }
+        dataPushingHandler.postDelayed(dataPushingRunnable, 500)
+    }
+    private fun startDataPostingHandler() {
         dataPostingHandler = Handler(Looper.getMainLooper())
         dataPostingRunnable = object : Runnable {
             override fun run() {
-                cd.observe(this@TagReadingActivity) { isConnected ->
-                    if(isConnected){
-                        if(tagDetails.isNotEmpty()){
-                            if(authResData?.Topic?.isNotEmpty() == true){
-                                val transactionTopic = authResData!!.Topic.filter { it.Title == "ReaderTransaction" }
-                                Log.e("Topic", transactionTopic.toString())
-                                if(transactionTopic.isNotEmpty()){
-                                    for (topic in transactionTopic) {
-                                        val topicName = topic.TopicName+sharedPreferencesUtils.getDeviceID()
-                                        Log.e("DATA", "Found Title: ${topic.Title}, TopicName: ${topic.TopicName}")
-                                        Log.e("TopicURL", topicName)
-                                        sendTagData(tagDetails, topicName)
-                                    }
+                    if (mqttConnection.isConnected()){
+                        executor.execute {
+                            var messagePair: Pair<String, String>? = null
+                            lock.lock()
+                            try {
+                                if (messageStack.isNotEmpty()) {
+                                    messagePair =
+                                        messageStack.pollLast() // get and remove top item (LIFO)
+                                    Log.e("queueStack1", messageStack.toString())
                                 }
+                            } finally {
+                                lock.unlock() // Always release lock
+                            }
+
+                            messagePair?.let { (topicName, message) ->
+                                Log.e("queueStack2", messagePair.toString())
+                                publishTagData(topicName, message) // Handle the message
                             }
                         }
                     }
-                }
-                dataPostingHandler.postDelayed(this, 2000)
+                dataPostingHandler.postDelayed(this, 700)
             }
+                // Adjust delay dynamically based on stack size
+                //val delayMillis = if (messageStack.size > 10) 100 else 200
+                //dataPostingHandler.postDelayed(this, delayMillis)
         }
-        dataPostingHandler.postDelayed(dataPostingRunnable, 0)
+        dataPostingHandler.postDelayed(dataPostingRunnable, 700)
     }
     private fun stopHandler(){
         antennaCheckHandler.removeCallbacks(antennaCheckRunnable)
         dataPostingHandler.removeCallbacks(dataPostingRunnable)
+        dataPushingHandler.removeCallbacks(dataPushingRunnable)
     }
     fun setListData(bean1: TagBean?){
         bean1?.let { myBean ->
-                val epcId = myBean.epcId
-                var rssiValue = myBean.rssi
-                val antennaId = myBean.antenna
-                val companyID = myBean.epcId.substring(0,2)
-                val hexCompanyID = ByteUtil.hexToString(companyID)
-
-//                if (rssiValue < 0) {
+            val epcId = myBean.epcId
+            var rssiValue = myBean.rssi
+            val antennaId = myBean.antenna
+            val companyID = myBean.epcId.substring(0,2)
+            val hexCompanyID = ByteUtil.hexToString(companyID)
+            //                if (rssiValue < 0) {
 //                    rssiValue *= -1
 //                }
 //                myBean.rssi = rssiValue
-                adapter.notifyDataSetChanged()
-                Log.e("STOPRFID:tagid", epcId)
-                Log.e("STOPRFID:ANTENA", antennaId)
-                Log.e("RSSI", rssiValue.toString())
-                Log.e("CompanyID", companyID)
-                Log.e("HexCompanyID", hexCompanyID)
-            //To show only one data at a time
+            Log.e("STOPRFID:tagid", epcId)
+            Log.e("STOPRFID:ANTENA", antennaId)
+            Log.e("RSSI", rssiValue.toString())
+            Log.e("CompanyID", companyID)
+            Log.e("HexCompanyID", hexCompanyID)
             if(hexCompanyID=="20"){
                 val isDuplicate = tagDetails.any { it.epcId == epcId && it.antenna == antennaId }
                 if (!isDuplicate) {
@@ -299,6 +327,8 @@ class TagReadingActivity : UHFActivity() {
         stopHandler()
         stopInventory()
         tagDetails.clear()
+        cd.unregisterNetworkCallback()
+        mqttConnection.disconnect()
     }
 
     override fun onPause() {
@@ -311,6 +341,8 @@ class TagReadingActivity : UHFActivity() {
         stopHandler()
         stopInventory()
         tagDetails.clear()
+        cd.unregisterNetworkCallback()
+        mqttConnection.disconnect()
     }
     fun isRFIDActive(): Boolean {
         return isRfidReadingIsInProgress
@@ -386,75 +418,78 @@ class TagReadingActivity : UHFActivity() {
             }
         })
     }
-    private fun sendTagData(tagData : MutableList<TagBean>, topicName : String){
-        mqttPub = MqttPublisher()
-        val jsonObject = JsonObject()
-        jsonObject.addProperty("PubDeviceID", sharedPreferencesUtils.getDeviceID())
-        jsonObject.addProperty("SubDeviceID", authResData?.PairedDeviceID ?: "")
-        val jsonArray = JsonArray()
-        if (tagData.isNotEmpty()) {
-            tagDetails.forEach{ data ->
-                val tags = JsonObject().apply {
-                    addProperty("TagID", data.epcId)
-                    addProperty("RSSI", data.rssi)
-                    addProperty("AntennaID", data.antenna)
-                }
-                jsonArray.add(tags)
+
+private fun pushToQueue(tagData : MutableList<TagBean>){
+    val jsonObject = JsonObject()
+    jsonObject.addProperty("messageType", "DataLogger")
+    jsonObject.addProperty("pubDeviceID", sharedPreferencesUtils.getDeviceID())
+    jsonObject.addProperty("subDeviceID", authResData?.PairedDeviceID ?: "")
+
+    // Create the data object
+    val dataObject = JsonObject()
+
+    val jsonArray = JsonArray()
+    if (tagData.isNotEmpty()) {
+        tagData.forEach{ data ->
+            val tags = JsonObject().apply {
+                addProperty("tagID", data.epcId)
+                addProperty("rssi", data.rssi)
+                addProperty("antennaID", data.antenna)
             }
-            jsonObject.add("TagDetails", jsonArray)
+            jsonArray.add(tags)
         }
-        Log.e("JSON", jsonObject.toString())
-        Log.e("Topic1", topicName)
-        if(mqttConnection.isConnected()){
-            mqttPub.publishMessage(mqttConnection, topicName,jsonObject.toString(),object : MqttResponseCallback {
-                override fun onPublishSuccess() {
-                    Log.e("Success", "Published SuccesFully")
-                    tagDetails.clear()
-                    totalCounts.set(0)
-                }
 
-                override fun onPublishFailure(error: String) {
-                    Log.e("Failure", error)
-                }
-
-            })
-        } else{
-            mqttConnect()
-            mqttPub.publishMessage(mqttConnection, topicName,jsonObject.toString(),object : MqttResponseCallback {
-                override fun onPublishSuccess() {
-                    Log.e("Success", "Published SuccesFully")
-                    tagDetails.clear()
-                    totalCounts.set(0)
-                }
-
-                override fun onPublishFailure(error: String) {
-                    Log.e("Failure", error)
-                }
-
-            })
-        }
-//        mqttPub.connectAndPublish("http://192.168.0.172/WMS31/",topicName, jsonObject.toString(), "Reader", object : MqttResponseCallback {
-//            override fun onPublishSuccess() {
-//                Log.e("Success", "Published SuccesFully")
-//                tagDetails.clear()
-//                totalCounts.set(0)
-//            }
-//
-//            override fun onPublishFailure(error: String) {
-//                Log.e("Failure", error)
-//            }
-//
-//        })
     }
+    // Add the TagDetails array to the data object
+    dataObject.add("tagDetails", jsonArray)
+
+    jsonObject.add("data", dataObject)
+
+    Log.e("JSON", jsonObject.toString())
+               val topicName : String = getTopicName("DataLogger")
+            if(topicName.isNotEmpty()){
+                lock.lock()
+                try{
+                    if (messageStack.size >= MAX_STACK_SIZE) {
+                        val removeCount = minOf((MAX_STACK_SIZE * 0.8).toInt(), messageStack.size) // Remove oldest 50 messages
+                        repeat(removeCount) {
+                            messageStack.removeLast() // FIFO: Remove oldest first
+                        }
+                    }
+//                    else if(messageStack.size >= ADJUST_STACK_SIZE) {
+//                        val removeCount = minOf(
+//                            (ADJUST_STACK_SIZE*0.6).toInt(),
+//                            messageStack.size
+//                        ) // Ensure we don't remove more than available
+//                        repeat(removeCount) {
+//                            messageStack.removeLast() // Remove oldest (FIFO order)
+//                        }
+//                    }
+                    messageStack.push(Pair(topicName,jsonObject.toString())) // LIFO: Newest message goes on top
+                    tagDetails.clear()
+                    totalCounts.set(0)
+                    adapter.notifyDataSetChanged()
+                    Log.e("queueStack", messageStack.toString())
+                }
+               finally {
+                   lock.unlock() // Always release lock
+               }
+
+            }
+}
     private fun sendConfigData(topicName : String){
-        mqttPub = MqttPublisher()
         var antennas = connectedAnts.joinToString(",")
         val jsonObject = JsonObject()
-        jsonObject.addProperty("PubDeviceID", sharedPreferencesUtils.getDeviceID())
-        jsonObject.addProperty("SubDeviceID", authResData?.PairedDeviceID ?: "")
-        jsonObject.addProperty("Power", binding.power.text.toString())
-        jsonObject.addProperty("ReaderStatus", true)
-        jsonObject.addProperty("AntennaID", antennas)
+        jsonObject.addProperty("messageType", "DataConfig")
+        jsonObject.addProperty("pubDeviceID", sharedPreferencesUtils.getDeviceID())
+        jsonObject.addProperty("subDeviceID", authResData?.PairedDeviceID ?: "")
+        val dataObj = JsonObject()
+
+        dataObj.addProperty("Power", binding.power.text.toString())
+        dataObj.addProperty("ReaderStatus", true)
+        dataObj.addProperty("AntennaID", antennas)
+
+        jsonObject.add("data", dataObj)
 
         Log.e("JSON", jsonObject.toString())
         Log.e("Topic1", topicName)
@@ -470,41 +505,126 @@ class TagReadingActivity : UHFActivity() {
                 }
             })
         }
-        else{
-            mqttConnect()
-            mqttPub.publishMessage(mqttConnection,topicName, jsonObject.toString(), object : MqttResponseCallback{
-                override fun onPublishSuccess() {
-                    Log.e("Success", "Published SuccesFully")
-                    antennas = ""
-                }
 
-                override fun onPublishFailure(error: String) {
-                    Log.e("Failure", error)
-                }
-            })
-        }
-//        mqttPub.connectAndPublish("http://192.168.0.172/WMS31/",topicName, jsonObject.toString(), "Reader",object : MqttResponseCallback{
-//                override fun onPublishSuccess() {
-//                    Log.e("Success", "Published SuccesFully")
-//                    antennas = ""
-//                }
-//
-//                override fun onPublishFailure(error: String) {
-//                    Log.e("Failure", error)
-//                }
-//            })
     }
     private fun mqttConnect(){
+        if (mqttConnection.isConnected()) {
+            Log.e("MQTT", "Already connected, skipping reconnection.")
+            return
+        }
         mqttConnection.connect("http://192.168.0.172/WMS31/", "Reader", object : MqttConnectionCallBack {
             override fun onSuccess() {
                 Log.e("MQTTConn", "MQTT connected Succesfully")
-                Toast.makeText(context, "MQTT connected Succesfully", Toast.LENGTH_SHORT).show()
             }
 
             override fun onFailure(errorMessage: String) {
                 Log.e("MQTTConn", errorMessage)
-
+//                if (cd.isConnected.value == true) {
+//
+//                    // Retry connection with delay
+//                    Handler(Looper.getMainLooper()).postDelayed({
+//                        if (!mqttConnection.isConnected()) {
+//                            mqttConnect()
+//                        }
+//                    }, 5000) // Retry every 5 seconds
+//                }
             }
         })
+    }
+//    private fun publishTagData(topicName: String, message: String){
+//        mqttPub = MqttPublisher()
+//        if(mqttConnection.isConnected()){
+//            mqttPub.publishMessage(mqttConnection, topicName,message,object : MqttResponseCallback {
+//                override fun onPublishSuccess() {
+//                    Log.e("Success", "Published SuccesFully")
+//                    //Remove the message only after successful publishing (LIFO)
+//                    synchronized(messageStack) {
+//                        if (messageStack.isNotEmpty() && messageStack.peek().second == message) {
+//                            messageStack.pop() // Remove the top message
+//                        }
+//                    }
+//
+//                }
+//                override fun onPublishFailure(error: String) {
+//                    Log.e("Failure", "Publish failed: $error")
+//                }
+//
+//           })
+//
+//        } else {
+//            mqttConnect()
+//        }
+//    }
+private fun publishTagData(topicName: String, message: String) {
+    if (mqttConnection.isConnected()) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+
+                val isPublished = publishMessageAsync(topicName, message)
+
+                if (isPublished) {
+                    Log.e("Success", "Published Successfully")
+                    //synchronized(messageStack) {
+//                    if (messageStack.isNotEmpty() && messageStack.peek().second == message) {
+//                        messageStack.pop() // Remove the message only after successful publishing
+//                    }
+                    //}
+                } else {
+                    Log.e("Failure", "Publish failed")
+
+                }
+            } catch (e: Exception) {
+                Log.e("Error", "Publishing error: ${e.message}")
+            }
+        }
+    }
+
+}
+    private suspend fun publishMessageAsync(topicName: String, message: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val result = CompletableDeferred<Boolean>()
+
+                mqttPub.publishMessage(mqttConnection, topicName, message, object : MqttResponseCallback {
+                    override fun onPublishSuccess() {
+                        result.complete(true)
+                    }
+
+                    override fun onPublishFailure(error: String) {
+                        result.complete(false)
+                    }
+                })
+
+                result.await() // Wait for publish result
+            } catch (e: Exception) {
+                Log.e("MQTT", "Publish exception: ${e.message}")
+                false
+            }
+        }
+    }
+    private fun getTopicName(topicHeader : String) : String {
+        var topicName = ""
+        if(authResData?.Topic?.isNotEmpty() == true) {
+            val topic = authResData!!.Topic.filter { it.Title == topicHeader }
+            if (topic.isNotEmpty()) {
+                for (t in topic) {
+                    topicName = t.TopicName+sharedPreferencesUtils.getDeviceID()
+                }
+            }
+        }
+       return topicName
+    }
+
+    override fun onNetworkChanged(isConnected: Boolean) {
+        if(isConnected){
+            if (!mqttConnection.isConnected()) {
+                Log.e("MQTT", "Network restored, attempting reconnection...")
+                Handler(Looper.getMainLooper()).postDelayed({
+                    mqttConnect()
+                }, 3000) // Delay to ensure network stability
+            }
+        } else{
+            mqttConnection.disconnect()
+        }
     }
 }
