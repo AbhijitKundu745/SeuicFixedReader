@@ -19,6 +19,7 @@ class SharedPreferencesUtils(context: Context) {
 
 
     private val URL = "URL"
+    private val IS_HOST_CONFIG = "IS_HOST_CONFIG"
     private val DEVICE_ID = "DEVICE_ID"
     private val PAIRED_DEVICE_ID = "PAIRED_DEVICE_ID"
     // 频段
@@ -113,7 +114,10 @@ class SharedPreferencesUtils(context: Context) {
         return sp.getInt(rssiStr, 50)
     }
     fun getURL(): String? {
-        return sp.getString(URL, "http://192.168.0.113/WMS31/")
+        return sp.getString(URL, "http://192.168.0.172/WMS12/")
+    }
+    fun getIsHostConfig(): Boolean {
+        return sp.getBoolean(IS_HOST_CONFIG, false)
     }
 
     /*
@@ -264,6 +268,10 @@ class SharedPreferencesUtils(context: Context) {
     }
     fun setURL(newValue: String): SharedPreferencesUtils {
         editor.putString(URL, newValue).apply()
+        return this
+    }
+    fun setIsHostConfig(newValue: Boolean): SharedPreferencesUtils {
+        editor.putBoolean(IS_HOST_CONFIG, newValue).apply()
         return this
     }
     fun setRegion(region: Int): SharedPreferencesUtils {

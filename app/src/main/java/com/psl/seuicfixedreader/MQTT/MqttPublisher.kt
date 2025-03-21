@@ -12,18 +12,10 @@ class MqttPublisher {
         Log.e("MqqCl", mqttClient.toString())
         if (mqttClient == null || !mqttConn.isConnected()) {
             Log.e("MQTT", "Cannot publish, MQTT client is not connected!")
+            return
 
-        } else{
-            mqttConn.connect("http://192.168.0.172/WMS31/", "Reader", object : MqttConnectionCallBack {
-                override fun onSuccess() {
-                    Log.e("MQTTConn", "MQTT connected Succesfully")
-                }
-
-                override fun onFailure(errorMessage: String) {
-                    Log.e("MQTTConn", errorMessage)
-                }
-            })
         }
+
         try{
             val messagePayload = message.toByteArray()
             mqttClient?.publish(topic, messagePayload, 1, false, null, object :

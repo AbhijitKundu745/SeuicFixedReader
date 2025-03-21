@@ -16,6 +16,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import com.psl.seuicfixedreader.APIHelpers.APIResponse
 import com.psl.seuicfixedreader.APIHelpers.APIService
 import com.psl.seuicfixedreader.APIHelpers.AuthRequest
@@ -24,6 +25,7 @@ import com.psl.seuicfixedreader.MQTT.MQTTConnection
 import com.psl.seuicfixedreader.MQTT.MqttConnectionCallBack
 import com.psl.seuicfixedreader.MQTT.MqttPublisher
 import com.psl.seuicfixedreader.MQTT.MqttResponseCallback
+import com.psl.seuicfixedreader.MQTT.MqttSubscriber
 import com.psl.seuicfixedreader.adapter.TagInfoAdapter
 import com.psl.seuicfixedreader.bean.TagBean
 import com.psl.seuicfixedreader.databinding.ActivityTagReadingBinding
@@ -38,8 +40,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Runnable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
+import org.eclipse.paho.mqttv5.client.IMqttToken
+import org.eclipse.paho.mqttv5.client.MqttCallback
+import org.eclipse.paho.mqttv5.client.MqttDisconnectResponse
+import org.eclipse.paho.mqttv5.common.MqttException
+import org.eclipse.paho.mqttv5.common.MqttMessage
+import org.eclipse.paho.mqttv5.common.packet.MqttProperties
 import retrofit2.Call
 import retrofit2.Callback
 import retrofit2.Response
@@ -57,7 +66,6 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
     private val context: Context = this
     lateinit var binding: ActivityTagReadingBinding
     private lateinit var sharedPreferencesUtils : SharedPreferencesUtils
-    private var deviceId : String= ""
     private lateinit var adapter : TagInfoAdapter
     private lateinit var antennaCheckHandler: Handler
     private lateinit var antennaCheckRunnable: Runnable
@@ -67,6 +75,7 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
     private var authResData: dataModels.AuthRes? = null
     private val tagDetails: MutableList<TagBean> = mutableListOf()
     private var mqttPub: MqttPublisher = MqttPublisher()
+    private var mqttSub: MqttSubscriber = MqttSubscriber()
     private lateinit var dataPostingHandler: Handler
     private lateinit var dataPostingRunnable: Runnable
     private lateinit var dataPushingHandler: Handler
@@ -76,31 +85,26 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
     private val messageStack: ConcurrentLinkedDeque<Pair<String, String>> = ConcurrentLinkedDeque()
     // Single-threaded executor ensures only one message is processed at a time
     private val executor = Executors.newSingleThreadExecutor()
-    private val MAX_STACK_SIZE = 150 // Adjust based on your needs
+    private val MAX_STACK_SIZE = 50 // Adjust based on your needs
     private val ADJUST_STACK_SIZE = (MAX_STACK_SIZE * 0.3).toInt() // Adjust based on your needs
     private val tagListLiveData = MutableLiveData<MutableList<TagBean>>(mutableListOf())
     private val lock = ReentrantLock() // Lock for exclusive access
-    @SuppressLint("HardwareIds", "SetTextI18n")
+    private var topics: HashMap<String, String>? = null
+    @SuppressLint("HardwareIds", "SetTextI18n", "SuspiciousIndentation")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = DataBindingUtil.setContentView(this, R.layout.activity_tag_reading)
         cd = ConnectionManager(this, this)
         cd.registerNetworkCallback()
         sharedPreferencesUtils = SharedPreferencesUtils(context)
-        deviceId = Settings.Secure.getString(this.contentResolver, Settings.Secure.ANDROID_ID)
-        deviceId = deviceId.uppercase()
-        Log.e("DeviceID", deviceId)
-        binding.deviceID.text = "DeviceID : "+ deviceId
-        sharedPreferencesUtils.setDeviceID(deviceId)
+
+        binding.deviceID.text = "DeviceID : "+ sharedPreferencesUtils.getDeviceID()
 
         adapter = TagInfoAdapter(R.layout.layout_tag)
         adapter.notifyDataSetChanged()
 
-         if(cd.isConnectedToWiFi()){
-                if(binding.showURL.text.isNotEmpty()){
-                    sharedPreferencesUtils.getDeviceID()?.let { getAuthorizeData(it) }
-                }
-        }
+        topics = intent.getSerializableExtra("TOPIC_LIST") as? HashMap<String, String>
+
 
         tagData.observe(this) {bean ->
             bean?.let {
@@ -114,10 +118,10 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
             tagData.postValue(null)
             adapter.notifyDataSetChanged()
             isRfidReadingIsInProgress = true
-            Handler(Looper.getMainLooper()).postDelayed({
-                Log.e("START INV", "HERE111")
+            CoroutineScope(Dispatchers.IO).launch{
+                delay(1000)
                 startInventory()
-            }, 1000)
+            }
         }
         binding.btnStop.setOnClickListener{
             stopInventory()
@@ -138,25 +142,13 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
                 updateCheckboxes(antennaArray)
                 if(mqttConnection.isConnected()) {
                         val topicName = getTopicName("DataConfig")
+                    val configTopic = topicName + sharedPreferencesUtils.getDeviceID()
                         if (topicName.isNotEmpty()) {
-                            sendConfigData(topicName)
+                            sendConfigData(configTopic)
                         }
                 }
             }
         }
-
-        binding.URLButton.setOnClickListener{
-            if (binding.URL.text.isNotEmpty()) {
-                sharedPreferencesUtils.setURL(binding.URL.text.toString())
-                binding.showURL.text = sharedPreferencesUtils.getURL().toString()
-                Toast.makeText(this, "URL Set", Toast.LENGTH_SHORT).show()
-                sharedPreferencesUtils.getDeviceID()?.let { getAuthorizeData(it) }
-            } else {
-                Toast.makeText(this, "No URL", Toast.LENGTH_SHORT).show()
-            }
-        }
-        binding.showURL.text = sharedPreferencesUtils.getURL().toString()
-
     }
     private fun startAntennaHandler() {
         antennaCheckHandler = Handler(Looper.getMainLooper())
@@ -172,14 +164,16 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
         dataPushingHandler = Handler(Looper.getMainLooper())
         dataPushingRunnable = object : Runnable {
             override fun run() {
-                if(tagDetails.isNotEmpty()){
+                //if(isRfidReadingIsInProgress)
+                if(tagDetails.isNotEmpty())
+                {
                     pushToQueue(tagDetails)
                 }
-                dataPushingHandler.postDelayed(this, 500)
+                dataPushingHandler.postDelayed(this, 700)
             }
 
         }
-        dataPushingHandler.postDelayed(dataPushingRunnable, 500)
+        dataPushingHandler.postDelayed(dataPushingRunnable, 700)
     }
     private fun startDataPostingHandler() {
         dataPostingHandler = Handler(Looper.getMainLooper())
@@ -214,9 +208,11 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
         dataPostingHandler.postDelayed(dataPostingRunnable, 700)
     }
     private fun stopHandler(){
-        antennaCheckHandler.removeCallbacks(antennaCheckRunnable)
-        dataPostingHandler.removeCallbacks(dataPostingRunnable)
-        dataPushingHandler.removeCallbacks(dataPushingRunnable)
+        CoroutineScope(Dispatchers.IO).launch {
+            antennaCheckHandler.removeCallbacks(antennaCheckRunnable)
+            dataPostingHandler.removeCallbacks(dataPostingRunnable)
+            dataPushingHandler.removeCallbacks(dataPushingRunnable)
+        }
     }
     fun setListData(bean1: TagBean?){
         bean1?.let { myBean ->
@@ -234,7 +230,7 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
             Log.e("RSSI", rssiValue.toString())
             Log.e("CompanyID", companyID)
             Log.e("HexCompanyID", hexCompanyID)
-            if(hexCompanyID=="20"){
+            if(hexCompanyID=="153"){ //hexCode of 99 is 153
                 val isDuplicate = tagDetails.any { it.epcId == epcId && it.antenna == antennaId }
                 if (!isDuplicate) {
                     tagDetails.add(myBean) // Add only if it's not a duplicate
@@ -327,6 +323,7 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
         stopHandler()
         stopInventory()
         tagDetails.clear()
+        adapter.notifyDataSetChanged()
         cd.unregisterNetworkCallback()
         mqttConnection.disconnect()
     }
@@ -337,12 +334,17 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
         stopInventory()
     }
     override fun onBackPressed() {
-        super.onBackPressed()
         stopHandler()
         stopInventory()
         tagDetails.clear()
+        adapter.notifyDataSetChanged()
         cd.unregisterNetworkCallback()
-        mqttConnection.disconnect()
+        CoroutineScope(Dispatchers.IO).launch {
+            if (mqttConnection.isConnected()) {
+                mqttConnection.disconnect()
+            }
+        }
+        super.onBackPressed()
     }
     fun isRFIDActive(): Boolean {
         return isRfidReadingIsInProgress
@@ -423,7 +425,7 @@ private fun pushToQueue(tagData : MutableList<TagBean>){
     val jsonObject = JsonObject()
     jsonObject.addProperty("messageType", "DataLogger")
     jsonObject.addProperty("pubDeviceID", sharedPreferencesUtils.getDeviceID())
-    jsonObject.addProperty("subDeviceID", authResData?.PairedDeviceID ?: "")
+    jsonObject.addProperty("subDeviceID", sharedPreferencesUtils.getPairedDeviceID() ?: "")
 
     // Create the data object
     val dataObject = JsonObject()
@@ -433,6 +435,7 @@ private fun pushToQueue(tagData : MutableList<TagBean>){
         tagData.forEach{ data ->
             val tags = JsonObject().apply {
                 addProperty("tagID", data.epcId)
+                addProperty("tagName","")
                 addProperty("rssi", data.rssi)
                 addProperty("antennaID", data.antenna)
             }
@@ -447,6 +450,7 @@ private fun pushToQueue(tagData : MutableList<TagBean>){
 
     Log.e("JSON", jsonObject.toString())
                val topicName : String = getTopicName("DataLogger")
+               val loggerTopic = topicName+sharedPreferencesUtils.getDeviceID()
             if(topicName.isNotEmpty()){
                 lock.lock()
                 try{
@@ -465,7 +469,7 @@ private fun pushToQueue(tagData : MutableList<TagBean>){
 //                            messageStack.removeLast() // Remove oldest (FIFO order)
 //                        }
 //                    }
-                    messageStack.push(Pair(topicName,jsonObject.toString())) // LIFO: Newest message goes on top
+                    messageStack.push(Pair(loggerTopic,jsonObject.toString())) // LIFO: Newest message goes on top
                     tagDetails.clear()
                     totalCounts.set(0)
                     adapter.notifyDataSetChanged()
@@ -482,7 +486,7 @@ private fun pushToQueue(tagData : MutableList<TagBean>){
         val jsonObject = JsonObject()
         jsonObject.addProperty("messageType", "DataConfig")
         jsonObject.addProperty("pubDeviceID", sharedPreferencesUtils.getDeviceID())
-        jsonObject.addProperty("subDeviceID", authResData?.PairedDeviceID ?: "")
+        jsonObject.addProperty("subDeviceID", sharedPreferencesUtils.getPairedDeviceID() ?: "")
         val dataObj = JsonObject()
 
         dataObj.addProperty("Power", binding.power.text.toString())
@@ -510,26 +514,24 @@ private fun pushToQueue(tagData : MutableList<TagBean>){
     private fun mqttConnect(){
         if (mqttConnection.isConnected()) {
             Log.e("MQTT", "Already connected, skipping reconnection.")
-            return
+            mqttConnection.disconnect()
         }
-        mqttConnection.connect("http://192.168.0.172/WMS31/", "Reader", object : MqttConnectionCallBack {
-            override fun onSuccess() {
-                Log.e("MQTTConn", "MQTT connected Succesfully")
-            }
+        CoroutineScope(Dispatchers.IO).launch {
+            delay(1000)
+            mqttConnection.connect(
+                sharedPreferencesUtils.getURL().toString(),
+                "Reader",
+                object : MqttConnectionCallBack {
+                    override fun onSuccess() {
+                        Log.e("MQTTConn1", "MQTT connected Succesfully - Version 2025-03-20")
+                        subscribe()
+                    }
 
-            override fun onFailure(errorMessage: String) {
-                Log.e("MQTTConn", errorMessage)
-//                if (cd.isConnected.value == true) {
-//
-//                    // Retry connection with delay
-//                    Handler(Looper.getMainLooper()).postDelayed({
-//                        if (!mqttConnection.isConnected()) {
-//                            mqttConnect()
-//                        }
-//                    }, 5000) // Retry every 5 seconds
-//                }
-            }
-        })
+                    override fun onFailure(errorMessage: String) {
+                        Log.e("MQTTConn", errorMessage)
+                    }
+                })
+        }
     }
 //    private fun publishTagData(topicName: String, message: String){
 //        mqttPub = MqttPublisher()
@@ -564,11 +566,6 @@ private fun publishTagData(topicName: String, message: String) {
 
                 if (isPublished) {
                     Log.e("Success", "Published Successfully")
-                    //synchronized(messageStack) {
-//                    if (messageStack.isNotEmpty() && messageStack.peek().second == message) {
-//                        messageStack.pop() // Remove the message only after successful publishing
-//                    }
-                    //}
                 } else {
                     Log.e("Failure", "Publish failed")
 
@@ -602,26 +599,104 @@ private fun publishTagData(topicName: String, message: String) {
             }
         }
     }
-    private fun getTopicName(topicHeader : String) : String {
-        var topicName = ""
-        if(authResData?.Topic?.isNotEmpty() == true) {
-            val topic = authResData!!.Topic.filter { it.Title == topicHeader }
-            if (topic.isNotEmpty()) {
-                for (t in topic) {
-                    topicName = t.TopicName+sharedPreferencesUtils.getDeviceID()
+
+private fun getTopicName(topicHeader : String) : String {
+    var topicName = ""
+    if(topics?.isNotEmpty() == true) {
+       topicName =topics?.get(topicHeader) ?: ""
+    }
+    return topicName
+}
+    private fun subscribe() {
+        Log.e("Here", "subscribeCalled")
+        if (mqttConnection.isConnected()) {
+            Log.e("Here1", "subscribeCalled")
+            CoroutineScope(Dispatchers.IO).launch {
+                Log.e("Here2", "subscribeCalled")
+                try {
+                    val commandTopic = getTopicName("Command")
+
+                    val subscribeTopic = "$commandTopic+/operation"
+                    Log.e("SubTopic", subscribeTopic)
+                    if (subscribeTopic.isNotEmpty()) {
+                        subscribeTopicAsync(subscribeTopic)
+                    } else {
+                        Log.e("MQTT", "Subscribe topic is empty, skipping subscription.")
+                    }
+                } catch (ex: Exception) {
+                    Log.e("Error", "Publishing error: ${ex.message}")
                 }
             }
         }
-       return topicName
+    }
+    private suspend fun subscribeTopicAsync(topicName: String) {
+        return withContext(Dispatchers.IO) {
+            try {
+                mqttSub.subscribeMessage(mqttConnection, topicName, object : MqttCallback {
+                    override fun disconnected(disconnectResponse: MqttDisconnectResponse?) {
+                        if (disconnectResponse != null) {
+                            Log.d("Disconnected Message", disconnectResponse.getReasonString())
+                        }
+                    }
+
+                    override fun mqttErrorOccurred(exception: MqttException?) {
+                        exception?.message?.let { Log.e("Exception Message", it) }
+                    }
+
+                    override fun messageArrived(topic: String?, message: MqttMessage?) {
+                        Log.e("Message Arrived Topic", topic!!)
+                        Log.e("Message Arrived", message.toString())
+                        CoroutineScope(Dispatchers.Main).launch {
+                            try {
+                                val msgStr = message.toString()
+                                val j = JsonParser.parseString(msgStr).asJsonObject
+                                val messageType = j.get("messageType")?.asString ?: "Unknown"
+                                val subDeviceID = j.get("subDeviceID")?.asString ?: "Unknown"
+
+                                if (messageType == "Command" && subDeviceID == sharedPreferencesUtils.getDeviceID()) {
+                                    j.getAsJsonObject("data")?.let { data ->
+                                        val readerCmd = data.get("ReaderCommand")?.asString
+
+                                        when (readerCmd) {
+                                            "ON" -> binding.btnStart.performClick()
+                                            "OFF" -> binding.btnStop.performClick()
+                                            else -> Log.e("CommandError", "Unknown ReaderCommand: $readerCmd")
+                                        }
+                                    }
+                                }
+                            } catch (ex: Exception) {
+                                Log.e("Receiving Error", ex.message.toString())
+                            }
+                        }
+                    }
+
+                    override fun deliveryComplete(token: IMqttToken?) {
+                        Log.d("Delivery Complete", "Message delivered");
+                    }
+
+                    override fun connectComplete(reconnect: Boolean, serverURI: String?) {
+                        Log.d("Connected Message", "Connected to: " + serverURI);
+                    }
+
+                    override fun authPacketArrived(reasonCode: Int, properties: MqttProperties?) {
+                        Log.d("Auth Packet Arrived", "Auth reason: " + reasonCode);
+                    }
+
+                })
+            } catch (e: Exception) {
+                Log.e("MQTT", "Publish exception: ${e.message}")
+            }
+        }
     }
 
     override fun onNetworkChanged(isConnected: Boolean) {
         if(isConnected){
             if (!mqttConnection.isConnected()) {
                 Log.e("MQTT", "Network restored, attempting reconnection...")
-                Handler(Looper.getMainLooper()).postDelayed({
+                CoroutineScope(Dispatchers.IO).launch{
+                    delay(3000)
                     mqttConnect()
-                }, 3000) // Delay to ensure network stability
+                }// Delay to ensure network stability
             }
         } else{
             mqttConnection.disconnect()

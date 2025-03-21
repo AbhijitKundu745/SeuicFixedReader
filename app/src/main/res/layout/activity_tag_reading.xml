@@ -128,43 +128,43 @@
                 android:textStyle="bold"
                 android:textSize="15sp"/>
         </LinearLayout>
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="URL: "
-            android:textSize="15sp"
-            android:layout_margin="5dp"
-            android:textStyle="bold"
-            android:textColor="@color/black"/>
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="50dp"
-            android:orientation="horizontal"
-            android:layout_margin="5dp">
-            <EditText
-                android:id="@+id/URL"
-                android:layout_width="0dp"
-                android:layout_height="match_parent"
-                android:layout_weight="1"
-                android:textColor="@color/blue"
-                android:layout_margin="2dp"/>
-            <Button
-                android:id="@+id/URLButton"
-                android:layout_width="0dp"
-                android:layout_height="40dp"
-                android:layout_weight="0.3"
-                android:text="Set"
-                android:layout_margin="2dp"/>
-        </LinearLayout>
-        <TextView
-            android:id="@+id/showURL"
-            android:layout_width="match_parent"
-            android:layout_height="40dp"
-            android:text="Set URL: "
-            android:textColor="@color/green"
-            android:textStyle="bold"
-            android:layout_margin="5dp"
-            android:gravity="center_vertical"/>
+<!--        <TextView-->
+<!--            android:layout_width="match_parent"-->
+<!--            android:layout_height="wrap_content"-->
+<!--            android:text="URL: "-->
+<!--            android:textSize="15sp"-->
+<!--            android:layout_margin="5dp"-->
+<!--            android:textStyle="bold"-->
+<!--            android:textColor="@color/black"/>-->
+<!--        <LinearLayout-->
+<!--            android:layout_width="match_parent"-->
+<!--            android:layout_height="50dp"-->
+<!--            android:orientation="horizontal"-->
+<!--            android:layout_margin="5dp">-->
+<!--            <EditText-->
+<!--                android:id="@+id/URL"-->
+<!--                android:layout_width="0dp"-->
+<!--                android:layout_height="match_parent"-->
+<!--                android:layout_weight="1"-->
+<!--                android:textColor="@color/blue"-->
+<!--                android:layout_margin="2dp"/>-->
+<!--            <Button-->
+<!--                android:id="@+id/URLButton"-->
+<!--                android:layout_width="0dp"-->
+<!--                android:layout_height="40dp"-->
+<!--                android:layout_weight="0.3"-->
+<!--                android:text="Set"-->
+<!--                android:layout_margin="2dp"/>-->
+<!--        </LinearLayout>-->
+<!--        <TextView-->
+<!--            android:id="@+id/showURL"-->
+<!--            android:layout_width="match_parent"-->
+<!--            android:layout_height="40dp"-->
+<!--            android:text="Set URL: "-->
+<!--            android:textColor="@color/green"-->
+<!--            android:textStyle="bold"-->
+<!--            android:layout_margin="5dp"-->
+<!--            android:gravity="center_vertical"/>-->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
