@@ -437,6 +437,7 @@ private fun pushToQueue(tagData : MutableList<TagBean>){
                 addProperty("tagID", data.epcId)
                 addProperty("tagName","")
                 addProperty("rssi", data.rssi)
+                addProperty("count", data.times)
                 addProperty("antennaID", data.antenna)
             }
             jsonArray.add(tags)
