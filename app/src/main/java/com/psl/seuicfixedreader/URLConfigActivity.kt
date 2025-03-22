@@ -147,6 +147,7 @@ class URLConfigActivity : AppCompatActivity(), ConnectionManager.ConnectionListe
                         sharedPreferencesUtils.setIsHostConfig(true)
                         sharedPreferencesUtils.setURL(url)
                         HOST_URL = url
+                        binding.showURL.text = HOST_URL
                         Toast.makeText(context, "Server URL configured successfully", Toast.LENGTH_SHORT).show()
                     }
                     else
