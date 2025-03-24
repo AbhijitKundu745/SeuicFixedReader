@@ -231,15 +231,16 @@ class TagReadingActivity : UHFActivity(), ConnectionManager.ConnectionListener {
             Log.e("CompanyID", companyID)
             Log.e("HexCompanyID", hexCompanyID)
             if(hexCompanyID=="153"){ //hexCode of 99 is 153
-                val isDuplicate = tagDetails.any { it.epcId == epcId && it.antenna == antennaId }
-                if (!isDuplicate) {
+                val existingTag = tagDetails.find { it.epcId == epcId && it.antenna == antennaId }
+                if (existingTag == null) {
                     tagDetails.add(myBean) // Add only if it's not a duplicate
                     adapter.setList(tagDetails)
-                    adapter.notifyDataSetChanged()
+                    adapter.notifyItemInserted(tagDetails.size-1)
 
                     Log.e("RFID: New Tag Added", "EPC: $epcId | Antenna: $antennaId")
                 } else {
-                    Log.e("RFID: Duplicate Tag Ignored", "EPC: $epcId | Antenna: $antennaId")
+                    existingTag.times = totalCounts.incrementAndGet() // Increment the existing object's count
+                    adapter.notifyItemChanged(tagDetails.indexOf(existingTag)) // Update only the modified item
                 }
             }
         }
